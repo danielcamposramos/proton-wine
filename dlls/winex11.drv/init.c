@@ -200,6 +200,7 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
 {
     if (!NtUserGetPresentRect( hwnd, rect, dpi ) && !NtUserGetClientRect( hwnd, rect, dpi )) return FALSE;
     OffsetRect( rect, -rect->left, -rect->top );
+    adjust_client_window_rect( hwnd, rect );
     return TRUE;
 }
 
@@ -368,6 +369,7 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     if (NtUserGetPresentRect( hwnd, &rect, dpi )) OffsetRect( &rect, -rect.left, -rect.top );
     else if (!NtUserGetClientRect( hwnd, &rect, dpi )) return;
     else NtUserMapWindowPoints( origin, toplevel, (POINT *)&rect, 2, dpi );
+    adjust_client_window_rect( hwnd, &rect );
 
     if ((data = get_win_data( toplevel )))
     {

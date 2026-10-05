@@ -517,6 +517,8 @@ enum x11drv_atoms
     XATOM_DndSelection,
     XATOM__ICC_PROFILE,
     XATOM__KDE_NET_WM_STATE_SKIP_SWITCHER,
+    XATOM__KDE_NET_WM_STEREO_CONTENT,
+    XATOM__KDE_NET_WM_STEREO_CONTENT_SUPPORTED,
     XATOM__MOTIF_WM_HINTS,
     XATOM__NET_ACTIVE_WINDOW,
     XATOM__NET_STARTUP_INFO_BEGIN,
@@ -752,6 +754,7 @@ extern void make_window_embedded( struct x11drv_win_data *data );
 extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap );
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
+extern void adjust_client_window_rect( HWND hwnd, RECT *rect );
 extern void destroy_client_window( HWND hwnd, Window client_window );
 extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
 extern void change_systray_owner( Display *display, Window systray_window );

@@ -2660,6 +2660,64 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
 }
 
 
+/***********************************************************************
+ *		get_cardinal_property
+ */
+static BOOL get_cardinal_property( Window window, Atom atom, long *value )
+{
+    Atom type;
+    int format;
+    unsigned long count, remaining;
+    unsigned char *data;
+    BOOL ret = FALSE;
+
+    if (XGetWindowProperty( gdi_display, window, atom, 0, 1, False, XA_CARDINAL,
+                            &type, &format, &count, &remaining, &data )) return FALSE;
+    if (type == XA_CARDINAL && format == 32 && count == 1)
+    {
+        *value = *(long *)data;
+        ret = TRUE;
+    }
+    XFree( data );
+    return ret;
+}
+
+
+/***********************************************************************
+ *		adjust_client_window_rect
+ *
+ * Adjust the client rect of a window to the size of its X client window. KWin makes a window that
+ * declares full side by side twice as wide as the Win32 one, and the client
+ * window holds both views.
+ */
+void adjust_client_window_rect( HWND hwnd, RECT *rect )
+{
+    static int support = -1;
+    struct x11drv_win_data *data;
+    Window root, whole_window = 0;
+    unsigned int width, height, border, depth;
+    int x, y, window_width = 0;
+    long value;
+
+    if (support < 0)
+    {
+        if (!get_cardinal_property( root_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT_SUPPORTED), &value )) value = 0;
+        support = value;
+    }
+    if (support < 3) return;
+
+    if ((data = get_win_data( hwnd )))
+    {
+        whole_window = data->whole_window;
+        window_width = data->rects.window.right - data->rects.window.left;
+        release_win_data( data );
+    }
+    if (!whole_window || !get_cardinal_property( whole_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &value ) || value != 3) return;
+    if (XGetGeometry( gdi_display, whole_window, &root, &x, &y, &width, &height, &border, &depth ))
+        rect->right += width - window_width;
+}
+
+
 /**********************************************************************
  *             attach_client_window
  */
