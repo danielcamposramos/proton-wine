@@ -1484,6 +1484,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
     }
 
     if (offscreen && !pglXWaitForSbcOML) XFlush( gdi_display );
+    if (base->stereo) sync_stereo_declaration( base->client->hwnd, gl->drawable );
 
     client_surface_present( base->client );
     return TRUE;

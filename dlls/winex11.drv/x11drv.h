@@ -755,6 +755,7 @@ extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualIn
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void adjust_client_window_rect( HWND hwnd, RECT *rect );
+extern void sync_stereo_declaration( HWND hwnd, Window client_window );
 extern void destroy_client_window( HWND hwnd, Window client_window );
 extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
 extern void change_systray_owner( Display *display, Window systray_window );

@@ -2684,19 +2684,13 @@ static BOOL get_cardinal_property( Window window, Atom atom, long *value )
 
 
 /***********************************************************************
- *		adjust_client_window_rect
+ *		get_stereo_support
  *
- * Adjust the client rect of a window to the size of its X client window. KWin makes a window that
- * declares full side by side twice as wide as the Win32 one, and the client
- * window holds both views.
+ * Get the version of stereo declaration that the window manager supports.
  */
-void adjust_client_window_rect( HWND hwnd, RECT *rect )
+static int get_stereo_support(void)
 {
     static int support = -1;
-    struct x11drv_win_data *data;
-    Window root, whole_window = 0;
-    unsigned int width, height, border, depth;
-    int x, y, window_width = 0;
     long value;
 
     if (support < 0)
@@ -2704,7 +2698,26 @@ void adjust_client_window_rect( HWND hwnd, RECT *rect )
         if (!get_cardinal_property( root_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT_SUPPORTED), &value )) value = 0;
         support = value;
     }
-    if (support < 3) return;
+    return support;
+}
+
+
+/***********************************************************************
+ *		adjust_client_window_rect
+ *
+ * Adjust the client rect of a window to the size of its X client window.
+ * KWin makes a window that declares full side by side twice as wide as the
+ * Win32 one, and the client window holds both views.
+ */
+void adjust_client_window_rect( HWND hwnd, RECT *rect )
+{
+    struct x11drv_win_data *data;
+    Window root, whole_window = 0;
+    unsigned int width, height, border, depth;
+    int x, y, window_width = 0;
+    long value;
+
+    if (get_stereo_support() < 3) return;
 
     if ((data = get_win_data( hwnd )))
     {
@@ -2715,6 +2728,33 @@ void adjust_client_window_rect( HWND hwnd, RECT *rect )
     if (!whole_window || !get_cardinal_property( whole_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &value ) || value != 3) return;
     if (XGetGeometry( gdi_display, whole_window, &root, &x, &y, &width, &height, &border, &depth ))
         rect->right += width - window_width;
+}
+
+
+/***********************************************************************
+ *		sync_stereo_declaration
+ *
+ * Carry the stereo declaration of a client window, which is where Mesa
+ * writes it, to the whole window, which is where KWin reads it.
+ */
+void sync_stereo_declaration( HWND hwnd, Window client_window )
+{
+    struct x11drv_win_data *data;
+    Window whole_window = 0;
+    long value, whole_value;
+
+    if (get_stereo_support() < 3) return;
+    if (!get_cardinal_property( client_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &value )) return;
+
+    if ((data = get_win_data( hwnd )))
+    {
+        whole_window = data->whole_window;
+        release_win_data( data );
+    }
+    if (!whole_window) return;
+    if (get_cardinal_property( whole_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &whole_value ) && whole_value == value) return;
+    XChangeProperty( gdi_display, whole_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), XA_CARDINAL, 32,
+                     PropModeReplace, (unsigned char *)&value, 1 );
 }
 
 
