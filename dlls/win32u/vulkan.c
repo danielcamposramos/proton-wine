@@ -1763,6 +1763,7 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
 {
     if (!NtUserGetPresentRect( hwnd, rect, dpi ) && !NtUserGetClientRect( hwnd, rect, dpi )) return FALSE;
     OffsetRect( rect, -rect->left, -rect->top );
+    if (driver_funcs->p_adjust_surface_rect) driver_funcs->p_adjust_surface_rect( hwnd, rect );
     return TRUE;
 }
 
