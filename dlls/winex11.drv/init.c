@@ -321,11 +321,54 @@ struct x11drv_client_surface
     HDC hdc_src;
     HDC hdc_dst;
     BOOL other_process;
+    BOOL layered_stereo;
 };
 
 static struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
 {
     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
+}
+
+/* Vulkan array extents are per eye. Only the X drawable is packed; exposing
+ * its doubled width to the game would grow every recreated swapchain. */
+void x11drv_vulkan_surface_rect( struct client_surface *client, RECT *rect )
+{
+    if (!impl_from_client_surface( client )->layered_stereo)
+        adjust_client_window_rect( client->hwnd, rect );
+}
+
+void x11drv_vulkan_surface_set_layers( struct client_surface *client, unsigned int layers )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    if (surface->layered_stereo && layers != 2)
+        clear_stereo_declaration( client->hwnd, surface->window );
+    surface->layered_stereo = layers == 2;
+}
+
+/* A packed fullscreen drawable must include the letterbox in each eye.
+ * Placing one letterboxed child inside a doubled whole window would move the
+ * eye boundary away from the middle of the window. */
+BOOL x11drv_vulkan_surface_get_scaling_rects( struct client_surface *client, unsigned int layers,
+                                            RECT *canvas, RECT *content )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_win_data *data;
+    BOOL ret = FALSE;
+
+    if (layers != 2 || !surface->raw || !enable_fullscreen_hack( client->hwnd )) return FALSE;
+    if (NtUserGetAncestor( client->hwnd, GA_ROOT ) != client->hwnd) return FALSE;
+    if (!(data = get_win_data( client->hwnd ))) return FALSE;
+    if (EqualRect( &data->rects.window, &data->rects.client ) &&
+        !IsRectEmpty( &data->rects.visible ) && !IsRectEmpty( &data->rects.client ))
+    {
+        *canvas = data->rects.visible;
+        *content = data->rects.client;
+        OffsetRect( content, -canvas->left, -canvas->top );
+        OffsetRect( canvas, -canvas->left, -canvas->top );
+        ret = TRUE;
+    }
+    release_win_data( data );
+    return ret;
 }
 
 static void x11drv_client_surface_destroy( struct client_surface *client )
@@ -335,6 +378,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
+    if (surface->layered_stereo) clear_stereo_declaration( hwnd, surface->window );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
@@ -364,18 +408,31 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     XWindowChanges changes = surface->changes;
     struct x11drv_win_data *data;
     int mask = 0;
-    RECT rect;
+    RECT rect, canvas, content;
 
     if (NtUserGetPresentRect( hwnd, &rect, dpi )) OffsetRect( &rect, -rect.left, -rect.top );
     else if (!NtUserGetClientRect( hwnd, &rect, dpi )) return;
     else NtUserMapWindowPoints( origin, toplevel, (POINT *)&rect, 2, dpi );
-    adjust_client_window_rect( hwnd, &rect );
+    sync_stereo_declaration( hwnd, surface->window );
+    if (surface->layered_stereo)
+    {
+        if (is_full_sbs_window( surface->window )) rect.right += rect.right - rect.left;
+    }
+    else
+        adjust_client_window_rect( hwnd, &rect );
 
     if ((data = get_win_data( toplevel )))
     {
         OffsetRect( &rect, data->rects.client.left - data->rects.visible.left,
                     data->rects.client.top - data->rects.visible.top );
         release_win_data( data );
+    }
+
+    if (surface->layered_stereo && is_full_sbs_window( surface->window ) &&
+        x11drv_vulkan_surface_get_scaling_rects( &surface->client, 2, &canvas, &content ))
+    {
+        rect = canvas;
+        rect.right *= 2;
     }
 
     changes.x = rect.left;
@@ -398,6 +455,19 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     XFlush( gdi_display );
 }
 
+static void client_surface_attach( struct x11drv_win_data *data, struct x11drv_client_surface *surface )
+{
+    BOOL reparent = data->whole_window && data->client_window != surface->window;
+
+    attach_client_window( data, surface->window );
+    /* Geometry was calculated before attachment. A stereo fullscreen child
+     * includes its own letterbox, so the ordinary reparent offset must not
+     * replace that position. The cached position would otherwise prevent
+     * later geometry updates from correcting it. */
+    if (reparent && surface->layered_stereo)
+        XMoveWindow( gdi_display, surface->window, surface->changes.x, surface->changes.y );
+}
+
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
     BOOL offscreen = needs_offscreen_rendering( hwnd );
@@ -411,7 +481,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     {
         if (!offscreen && (data = get_win_data( hwnd )))
         {
-            attach_client_window( data, surface->window );
+            client_surface_attach( data, surface );
             release_win_data( data );
         }
         return;
@@ -448,7 +518,7 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     if ((data = get_win_data( hwnd )))
     {
         if (offscreen) detach_client_window( data, surface->window );
-        else attach_client_window( data, surface->window );
+        else client_surface_attach( data, surface );
         release_win_data( data );
     }
 

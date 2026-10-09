@@ -145,6 +145,7 @@ struct surface
     struct vulkan_surface obj;
     struct client_surface *client;
     HWND hwnd;
+    struct swapchain *active_swapchain;
 };
 
 static struct surface *surface_from_handle( VkSurfaceKHR handle )
@@ -166,6 +167,12 @@ static BOOL fs_hack_is_integer(void)
     return is_int;
 }
 
+struct fs_hack_layer
+{
+    VkImageView user_view, blit_view;
+    VkDescriptorSet descriptor_set;
+};
+
 struct fs_hack_image
 {
     uint32_t cmd_queue_idx;
@@ -173,8 +180,7 @@ struct fs_hack_image
     VkImage swapchain_image;
     VkImage user_image;
     VkSemaphore blit_finished;
-    VkImageView user_view, blit_view;
-    VkDescriptorSet descriptor_set;
+    struct fs_hack_layer *layers;
 };
 
 static const char *debugstr_vkextent2d( const VkExtent2D *ext )
@@ -192,9 +198,10 @@ struct swapchain
     /* fs hack data below */
     UINT fshack_dpi;
     VkExtent2D host_extents;
+    RECT blit_rect;
     VkCommandPool *cmd_pools; /* VkCommandPool[device->queue_count] */
     VkDeviceMemory user_image_memory;
-    uint32_t n_images;
+    uint32_t n_images, layer_count;
     struct fs_hack_image *fs_hack_images; /* struct fs_hack_image[n_images] */
     VkSampler sampler;
     VkDescriptorPool descriptor_pool;
@@ -1759,11 +1766,12 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
     free( surface );
 }
 
-static BOOL get_surface_rect( HWND hwnd, RECT *rect, UINT dpi )
+static BOOL get_surface_rect( struct surface *surface, RECT *rect, UINT dpi )
 {
+    HWND hwnd = surface->hwnd;
     if (!NtUserGetPresentRect( hwnd, rect, dpi ) && !NtUserGetClientRect( hwnd, rect, dpi )) return FALSE;
     OffsetRect( rect, -rect->left, -rect->top );
-    if (driver_funcs->p_adjust_surface_rect) driver_funcs->p_adjust_surface_rect( hwnd, rect );
+    if (driver_funcs->p_adjust_surface_rect) driver_funcs->p_adjust_surface_rect( surface->client, rect );
     return TRUE;
 }
 
@@ -1783,7 +1791,7 @@ static void adjust_surface_capabilities( struct vulkan_instance *instance, struc
 
     /* Update the image extents to match what the Win32 WSI would provide. */
     /* FIXME: handle DPI scaling, somehow */
-    get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
+    get_surface_rect( surface, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) );
     capabilities->minImageExtent.width = client_rect.right - client_rect.left;
     capabilities->minImageExtent.height = client_rect.bottom - client_rect.top;
     capabilities->maxImageExtent.width = client_rect.right - client_rect.left;
@@ -2142,7 +2150,7 @@ static VkResult create_pipeline( struct vulkan_device *device, struct swapchain 
     return VK_SUCCESS;
 }
 
-static VkResult create_descriptor_set( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
+static VkResult create_descriptor_set( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_layer *layer )
 {
     VkDescriptorImageInfo userDescriptorImageInfo = {0}, realDescriptorImageInfo = {0};
     VkDescriptorSetAllocateInfo descriptorAllocInfo = {0};
@@ -2154,21 +2162,21 @@ static VkResult create_descriptor_set( struct vulkan_device *device, struct swap
     descriptorAllocInfo.descriptorSetCount = 1;
     descriptorAllocInfo.pSetLayouts = &swapchain->descriptor_set_layout;
 
-    if ((res = device->p_vkAllocateDescriptorSets( device->host.device, &descriptorAllocInfo, &hack->descriptor_set )))
+    if ((res = device->p_vkAllocateDescriptorSets( device->host.device, &descriptorAllocInfo, &layer->descriptor_set )))
     {
         ERR( "vkAllocateDescriptorSets: %d\n", res );
         return res;
     }
 
     userDescriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    userDescriptorImageInfo.imageView = hack->user_view;
+    userDescriptorImageInfo.imageView = layer->user_view;
     userDescriptorImageInfo.sampler = swapchain->sampler;
 
     realDescriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    realDescriptorImageInfo.imageView = hack->blit_view;
+    realDescriptorImageInfo.imageView = layer->blit_view;
 
     descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptorWrites[0].dstSet = hack->descriptor_set;
+    descriptorWrites[0].dstSet = layer->descriptor_set;
     descriptorWrites[0].dstBinding = 0;
     descriptorWrites[0].dstArrayElement = 0;
     descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -2176,7 +2184,7 @@ static VkResult create_descriptor_set( struct vulkan_device *device, struct swap
     descriptorWrites[0].pImageInfo = &userDescriptorImageInfo;
 
     descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    descriptorWrites[1].dstSet = hack->descriptor_set;
+    descriptorWrites[1].dstSet = layer->descriptor_set;
     descriptorWrites[1].dstBinding = 1;
     descriptorWrites[1].dstArrayElement = 0;
     descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
@@ -2200,7 +2208,7 @@ static VkResult init_blit_images( struct vulkan_device *device, struct swapchain
     VkShaderModuleCreateInfo shaderInfo = {0};
     VkShaderModule shaderModule = 0;
     VkImageViewCreateInfo viewInfo = {0};
-    uint32_t i;
+    uint32_t i, layer;
 
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = samplerInfo.minFilter = fs_hack_is_integer() ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
@@ -2225,14 +2233,14 @@ static VkResult init_blit_images( struct vulkan_device *device, struct swapchain
     }
 
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[0].descriptorCount = swapchain->n_images;
+    poolSizes[0].descriptorCount = swapchain->n_images * swapchain->layer_count;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    poolSizes[1].descriptorCount = swapchain->n_images;
+    poolSizes[1].descriptorCount = swapchain->n_images * swapchain->layer_count;
 
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     poolInfo.poolSizeCount = 2;
     poolInfo.pPoolSizes = poolSizes;
-    poolInfo.maxSets = swapchain->n_images;
+    poolInfo.maxSets = swapchain->n_images * swapchain->layer_count;
 
     if ((res = device->p_vkCreateDescriptorPool( device->host.device, &poolInfo, NULL, &swapchain->descriptor_pool )))
     {
@@ -2293,6 +2301,7 @@ static VkResult init_blit_images( struct vulkan_device *device, struct swapchain
     if ((res = create_pipeline( device, swapchain, shaderModule ))) goto fail;
 
     device->p_vkDestroyShaderModule( device->host.device, shaderModule, NULL );
+    shaderModule = VK_NULL_HANDLE;
 
     for (i = 0; i < swapchain->n_images; ++i)
     {
@@ -2308,13 +2317,18 @@ static VkResult init_blit_images( struct vulkan_device *device, struct swapchain
         viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
-        if ((res = device->p_vkCreateImageView( device->host.device, &viewInfo, NULL, &hack->blit_view )))
+        for (layer = 0; layer < swapchain->layer_count; ++layer)
         {
-            ERR( "vkCreateImageView(blit): %d\n", res );
-            goto fail;
-        }
+            viewInfo.subresourceRange.baseArrayLayer = layer;
+            if ((res = device->p_vkCreateImageView( device->host.device, &viewInfo, NULL,
+                                                    &hack->layers[layer].blit_view )))
+            {
+                ERR( "vkCreateImageView(blit): %d\n", res );
+                goto fail;
+            }
 
-        if ((res = create_descriptor_set( device, swapchain, hack ))) goto fail;
+            if ((res = create_descriptor_set( device, swapchain, &hack->layers[layer] ))) goto fail;
+        }
     }
 
     return VK_SUCCESS;
@@ -2324,8 +2338,11 @@ fail:
     {
         struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
 
-        device->p_vkDestroyImageView( device->host.device, hack->blit_view, NULL );
-        hack->blit_view = VK_NULL_HANDLE;
+        for (layer = 0; layer < swapchain->layer_count; ++layer)
+        {
+            device->p_vkDestroyImageView( device->host.device, hack->layers[layer].blit_view, NULL );
+            hack->layers[layer].blit_view = VK_NULL_HANDLE;
+        }
     }
 
     device->p_vkDestroyShaderModule( device->host.device, shaderModule, NULL );
@@ -2350,8 +2367,17 @@ fail:
 
 static void destroy_fs_hack_image( struct vulkan_device *device, struct swapchain *swapchain, struct fs_hack_image *hack )
 {
-    device->p_vkDestroyImageView( device->host.device, hack->user_view, NULL );
-    device->p_vkDestroyImageView( device->host.device, hack->blit_view, NULL );
+    uint32_t layer;
+
+    if (hack->layers)
+    {
+        for (layer = 0; layer < swapchain->layer_count; ++layer)
+        {
+            device->p_vkDestroyImageView( device->host.device, hack->layers[layer].user_view, NULL );
+            device->p_vkDestroyImageView( device->host.device, hack->layers[layer].blit_view, NULL );
+        }
+        free( hack->layers );
+    }
     device->p_vkDestroyImage( device->host.device, hack->user_image, NULL );
     if (hack->cmd) device->p_vkFreeCommandBuffers( device->host.device, swapchain->cmd_pools[hack->cmd_queue_idx], 1, &hack->cmd );
     device->p_vkDestroySemaphore( device->host.device, hack->blit_finished, NULL );
@@ -2371,7 +2397,7 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
     VkMemoryAllocateInfo allocInfo = {0};
     VkPhysicalDeviceMemoryProperties memProperties;
     VkImageViewCreateInfo viewInfo = {0};
-    uint32_t count, i = 0, user_memory_type = -1;
+    uint32_t count, i = 0, layer, user_memory_type = -1;
 
     if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain, &count, NULL )))
     {
@@ -2439,6 +2465,11 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
         userMemTotal += userMemReq.size;
 
         swapchain->n_images++;
+        if (!(hack->layers = calloc( swapchain->layer_count, sizeof(*hack->layers) )))
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto fail;
+        }
     }
 
     /* allocate backing memory */
@@ -2502,11 +2533,15 @@ static VkResult init_fs_hack_images( struct vulkan_device *device, struct swapch
         viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
-        if ((res = device->p_vkCreateImageView( device->host.device, &viewInfo, NULL,
-                                                &swapchain->fs_hack_images[i].user_view )))
+        for (layer = 0; layer < swapchain->layer_count; ++layer)
         {
-            ERR( "vkCreateImageView(user): %d\n", res );
-            goto fail;
+            viewInfo.subresourceRange.baseArrayLayer = layer;
+            if ((res = device->p_vkCreateImageView( device->host.device, &viewInfo, NULL,
+                                                    &swapchain->fs_hack_images[i].layers[layer].user_view )))
+            {
+                ERR( "vkCreateImageView(user): %d\n", res );
+                goto fail;
+            }
         }
     }
 
@@ -2540,7 +2575,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSwapchainCreateInfoKHR create_info_host = *create_info;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
-    RECT client_rect;
+    RECT client_rect, canvas;
     VkResult res;
 
     if (!NtUserIsWindow( surface->hwnd ))
@@ -2563,7 +2598,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
      * display mode change emulation), MoltenVK's vkQueuePresentKHR returns VK_SUBOPTIMAL_KHR.
      * Create the swapchain with VkSwapchainPresentScalingCreateInfoEXT to avoid this.
      */
-    if (get_surface_rect( surface->hwnd, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
+    if (get_surface_rect( surface, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ) &&
         !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
         instance->extensions.has_VK_EXT_surface_maintenance1 &&
         physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
@@ -2590,7 +2625,22 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
 
         swapchain->host_extents = capabilities.minImageExtent;
-        create_info_host.imageExtent = capabilities.minImageExtent;
+        /* The old drawable may still include a stereo canvas. Size the new
+         * presentation from the current Win32 content before applying packing. */
+        if (get_surface_rect( surface, &client_rect, NtUserGetWinMonitorDpi( surface->hwnd, MDT_WINE_RAW_DPI ) ))
+        {
+            swapchain->host_extents.width = max( 1, client_rect.right - client_rect.left );
+            swapchain->host_extents.height = max( 1, client_rect.bottom - client_rect.top );
+        }
+        SetRect( &swapchain->blit_rect, 0, 0, swapchain->host_extents.width, swapchain->host_extents.height );
+        if (driver_funcs->p_surface_get_scaling_rects &&
+            driver_funcs->p_surface_get_scaling_rects( surface->client, create_info->imageArrayLayers,
+                                                       &canvas, &swapchain->blit_rect ))
+        {
+            swapchain->host_extents.width = canvas.right - canvas.left;
+            swapchain->host_extents.height = canvas.bottom - canvas.top;
+        }
+        create_info_host.imageExtent = swapchain->host_extents;
         create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
 
@@ -2608,6 +2658,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;
+    swapchain->layer_count = create_info->imageArrayLayers;
     instance->p_insert_object( instance, &swapchain->obj.obj );
 
     if (swapchain->fshack_dpi)
@@ -2632,6 +2683,11 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
               debugstr_vkextent2d(&swapchain->extents), debugstr_vkextent2d(&swapchain->host_extents) );
     }
 
+    surface->active_swapchain = swapchain;
+    if (driver_funcs->p_surface_set_layers)
+        driver_funcs->p_surface_set_layers( surface->client, create_info->imageArrayLayers );
+    /* Carry the declaration and size the drawable before the first present. */
+    client_surface_update( surface->client );
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
 }
@@ -2671,6 +2727,13 @@ void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
+    if (swapchain->surface->active_swapchain == swapchain)
+    {
+        swapchain->surface->active_swapchain = NULL;
+        if (driver_funcs->p_surface_set_layers)
+            driver_funcs->p_surface_set_layers( swapchain->surface->client, 0 );
+        client_surface_update( swapchain->surface->client );
+    }
     free( swapchain );
 }
 
@@ -2697,7 +2760,7 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
         return VK_SUBOPTIMAL_KHR;
     }
 
-    if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+    if (!res && get_surface_rect( surface, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
@@ -2729,7 +2792,7 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
         return VK_SUBOPTIMAL_KHR;
     }
 
-    if (!res && get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
+    if (!res && get_surface_rect( surface, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
         WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
@@ -2798,6 +2861,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     VkImageMemoryBarrier barriers[3] = {{0}};
     VkCommandBufferBeginInfo beginInfo = {0};
     float constants[4];
+    uint32_t layer;
 
     TRACE( "recording compute command\n" );
 
@@ -2818,7 +2882,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     barriers[0].subresourceRange.baseMipLevel = 0;
     barriers[0].subresourceRange.levelCount = 1;
     barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = 1;
+    barriers[0].subresourceRange.layerCount = swapchain->layer_count;
     barriers[0].srcAccessMask = 0;
     barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
@@ -2834,7 +2898,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     barriers[1].subresourceRange.baseMipLevel = 0;
     barriers[1].subresourceRange.levelCount = 1;
     barriers[1].subresourceRange.baseArrayLayer = 0;
-    barriers[1].subresourceRange.layerCount = 1;
+    barriers[1].subresourceRange.layerCount = swapchain->layer_count;
     barriers[1].srcAccessMask = 0;
     barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 
@@ -2844,26 +2908,31 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     /* perform blit shader */
     device->p_vkCmdBindPipeline( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, swapchain->pipeline );
 
-    device->p_vkCmdBindDescriptorSets( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                       swapchain->pipeline_layout, 0, 1, &hack->descriptor_set, 0, NULL );
-
     /* vec2: blit dst offset in real coords */
-    constants[0] = 0;
-    constants[1] = 0;
-
-    /* offset by 0.5f because sampling is relative to pixel center */
-    constants[0] -= 0.5f * swapchain->host_extents.width / swapchain->extents.width;
-    constants[1] -= 0.5f * swapchain->host_extents.height / swapchain->extents.height;
+    constants[0] = swapchain->blit_rect.left;
+    constants[1] = swapchain->blit_rect.top;
 
     /* vec2: blit dst extents in real coords */
-    constants[2] = swapchain->host_extents.width;
-    constants[3] = swapchain->host_extents.height;
+    constants[2] = swapchain->blit_rect.right - swapchain->blit_rect.left;
+    constants[3] = swapchain->blit_rect.bottom - swapchain->blit_rect.top;
+
+    /* offset by 0.5f because sampling is relative to pixel center */
+    constants[0] -= 0.5f * constants[2] / swapchain->extents.width;
+    constants[1] -= 0.5f * constants[3] / swapchain->extents.height;
+
     device->p_vkCmdPushConstants( hack->cmd, swapchain->pipeline_layout,
                                   VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants );
 
-    /* local sizes in shader are 8 */
-    device->p_vkCmdDispatch( hack->cmd, ceil( swapchain->host_extents.width / 8. ),
-                             ceil( swapchain->host_extents.height / 8. ), 1 );
+    /* Scale every array layer; a stereo swapchain carries one view per layer. */
+    for (layer = 0; layer < swapchain->layer_count; ++layer)
+    {
+        device->p_vkCmdBindDescriptorSets( hack->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                         swapchain->pipeline_layout, 0, 1,
+                                         &hack->layers[layer].descriptor_set, 0, NULL );
+        /* local sizes in shader are 8 */
+        device->p_vkCmdDispatch( hack->cmd, ceil( swapchain->host_extents.width / 8. ),
+                                 ceil( swapchain->host_extents.height / 8. ), 1 );
+    }
 
     /* transition user image from SHADER_READ back to PRESENT_SRC */
     barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -2876,7 +2945,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     barriers[0].subresourceRange.baseMipLevel = 0;
     barriers[0].subresourceRange.levelCount = 1;
     barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = 1;
+    barriers[0].subresourceRange.layerCount = swapchain->layer_count;
     barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barriers[0].dstAccessMask = 0;
 
@@ -2891,7 +2960,7 @@ static VkResult record_compute_cmd( struct vulkan_device *device, struct swapcha
     barriers[1].subresourceRange.baseMipLevel = 0;
     barriers[1].subresourceRange.levelCount = 1;
     barriers[1].subresourceRange.baseArrayLayer = 0;
-    barriers[1].subresourceRange.layerCount = 1;
+    barriers[1].subresourceRange.layerCount = swapchain->layer_count;
     barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barriers[1].dstAccessMask = 0;
 
@@ -3012,7 +3081,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         client_surface_present( surface->client );
 
         if (swapchain_res < VK_SUCCESS) continue;
-        if (!get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
+        if (!get_surface_rect( surface, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))
         {
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
             if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;

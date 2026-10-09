@@ -2757,6 +2757,32 @@ void sync_stereo_declaration( HWND hwnd, Window client_window )
                      PropModeReplace, (unsigned char *)&value, 1 );
 }
 
+/* Only the currently attached client may clear its declaration. Destroying a
+ * retired swapchain/client must not turn a replacement surface back to mono. */
+BOOL is_full_sbs_window( Window window )
+{
+    long value;
+    return get_stereo_support() >= 3 &&
+        get_cardinal_property( window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &value ) && value == 3;
+}
+
+void clear_stereo_declaration( HWND hwnd, Window client_window )
+{
+    struct x11drv_win_data *data;
+    long value;
+
+    if (get_cardinal_property( client_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &value ) && value == 3)
+        XDeleteProperty( gdi_display, client_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT) );
+    if ((data = get_win_data( hwnd )))
+    {
+        if (data->client_window == client_window && data->whole_window &&
+            get_cardinal_property( data->whole_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT), &value ) && value == 3)
+            XDeleteProperty( gdi_display, data->whole_window, x11drv_atom(_KDE_NET_WM_STEREO_CONTENT) );
+        release_win_data( data );
+    }
+    XFlush( gdi_display );
+}
+
 
 /**********************************************************************
  *             attach_client_window

@@ -756,6 +756,12 @@ extern void detach_client_window( struct x11drv_win_data *data, Window client_wi
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void adjust_client_window_rect( HWND hwnd, RECT *rect );
 extern void sync_stereo_declaration( HWND hwnd, Window client_window );
+extern void clear_stereo_declaration( HWND hwnd, Window client_window );
+extern BOOL is_full_sbs_window( Window window );
+extern void x11drv_vulkan_surface_rect( struct client_surface *client, RECT *rect );
+extern void x11drv_vulkan_surface_set_layers( struct client_surface *client, unsigned int layers );
+extern BOOL x11drv_vulkan_surface_get_scaling_rects( struct client_surface *client, unsigned int layers,
+                                                    RECT *canvas, RECT *content );
 extern void destroy_client_window( HWND hwnd, Window client_window );
 extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
 extern void change_systray_owner( Display *display, Window systray_window );
