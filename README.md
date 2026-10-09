@@ -1,3 +1,28 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/sparky-stereo-os/sparkyos-swirl-light-128.png">
+  <img src=".github/sparky-stereo-os/sparkyos-swirl-dark-128.png" alt="SparkyOS" width="128" height="128">
+</picture>
+
+## SPARKY STEREO OS
+
+This is the stereo version of Wine by Sparky Stereo OS, forked from [ValveSoftware/wine](https://github.com/ValveSoftware/wine).
+It carries a window's stereo declaration and its full side by side size from the client window to the whole window, for programs that draw with Vulkan.
+
+Where it comes from:
+
+- [Wine](https://www.winehq.org/) is made by the Wine project authors; see AUTHORS. Alexandre Julliard maintains it. This is the Wine of Valve's [Proton](https://github.com/ValveSoftware/Proton).
+- [Debian](https://www.debian.org/) is the base of the system.
+- [SparkyLinux](https://sparkylinux.org/), by Paweł "pavroo" Pijanowski, builds on Debian.
+- [Sparky Stereo OS](https://github.com/Sparky-OS/sparky-stereo-os) is the stereo 3D edition of SparkyLinux: SparkyOS, powered by Debian.
+
+The `stereo3d` branch holds the version the distribution builds.
+The branch starts from `proton_11.0`.
+The licence is unchanged; see LICENSE.
+
+Sparky Stereo OS, Daniel Ramos's edition of SparkyLinux (by Paweł "pavroo" Pijanowski).
+
+---
+
 ## INTRODUCTION
 
 Wine is a program which allows running Microsoft Windows programs
